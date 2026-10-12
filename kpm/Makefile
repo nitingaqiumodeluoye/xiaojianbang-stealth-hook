@@ -2,6 +2,8 @@ ifndef KP_DIR
     KP_DIR = /home/xiaojianbang/bin/KernelPatch-main
 endif
 
+# Default to the author's local AOSP clang; override for CI / other machines:
+#   make KP_DIR=/path/to/KernelPatch CC=clang
 CC = /home/xiaojianbang/bin/aosp/prebuilts/clang/host/linux-x86/clang-r522817/bin/clang
 CFLAGS = --target=aarch64-linux-gnu -Os -fno-stack-protector -fno-asynchronous-unwind-tables -fno-PIC -fno-plt -Wno-unused-function
 

@@ -1,0 +1,113 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      kp_ref:
+        description: 'KernelPatch ref (tag / branch / sha) used as the KPM SDK'
+        required: false
+        default: '0.13.1'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: KPM + userspace (arm64)
+    runs-on: ubuntu-latest
+    env:
+      # KernelPatch source is required as the KPM SDK (headers only, no kpimg build)
+      KP_REF: ${{ github.event.inputs.kp_ref || '0.13.1' }}
+      KP_DIR: ${{ github.workspace }}/.kp/KernelPatch
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout KernelPatch (${{ env.KP_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: bmax121/KernelPatch
+          ref: ${{ env.KP_REF }}
+          path: .kp/KernelPatch
+          fetch-depth: 1
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          echo "--- clang ---";                clang --version | head -1
+          echo "--- aarch64 gcc ---";          aarch64-linux-gnu-gcc --version | head -1
+          echo "--- KernelPatch version ---";  cat "$KP_DIR/version"
+
+      - name: Build KPM
+        run: |
+          # kpm/Makefile hardcodes the author's local clang path -> override on the
+          # command line (command-line variables win over Makefile assignments).
+          make -C kpm clean
+          make -C kpm -j"$(nproc)" KP_DIR="$KP_DIR" CC=clang
+          echo "--- KPM ---"
+          file kpm/xiaojianbang-stealth-hook.kpm
+          ls -l kpm/xiaojianbang-stealth-hook.kpm
+
+      # Fail fast with compiler context if the KPM build breaks
+      - name: Show KPM diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== verbose rebuild of first failing object ==="
+          make -C kpm KP_DIR="$KP_DIR" CC=clang stealth_hook.o 2>&1 | tail -60 || true
+
+      - name: Build userspace
+        run: |
+          make -C userspace clean
+          make -C userspace -j"$(nproc)" TARGET_COMPILE=aarch64-linux-gnu-
+          echo "--- userspace ---"
+          file userspace/xiaojianbang_hook userspace/sh_control \
+               userspace/kpm_loader userspace/memread
+          ls -l userspace/xiaojianbang_hook
+
+      - name: Collect and verify artifacts
+        run: |
+          mkdir -p dist
+          # The two files users actually need
+          cp kpm/xiaojianbang-stealth-hook.kpm dist/
+          cp userspace/xiaojianbang_hook          dist/
+          # Helper/debug tools
+          cp userspace/sh_control                 dist/
+          cp userspace/kpm_loader                 dist/
+          cp userspace/memread                    dist/
+
+          # Every binary must be AArch64
+          aarch64-linux-gnu-readelf -h dist/xiaojianbang_hook | grep -i 'Machine'
+          test "$(aarch64-linux-gnu-readelf -h dist/xiaojianbang_hook | awk '/Machine/{print $2}')" = "AArch64"
+          echo "--- dist ---"
+          file dist/*
+          ls -l dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiaojianbang-stealth-hook
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Release ships exactly the two files the README documents
+          gh release create "$GITHUB_REF_NAME" \
+            dist/xiaojianbang-stealth-hook.kpm \
+            dist/xiaojianbang_hook \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --repo "$GITHUB_REPOSITORY" \
+          || gh release upload "$GITHUB_REF_NAME" \
+            dist/xiaojianbang-stealth-hook.kpm \
+            dist/xiaojianbang_hook \
+            --clobber --repo "$GITHUB_REPOSITORY"
