@@ -17,10 +17,16 @@
 #define SUPERCALL_KPM_LIST   0x1031
 #define SUPERCALL_KPM_INFO   0x1032
 
-/* Must match the version used when patching boot (KP 0.13.1 = 0x0D01) */
+/* Version code placed in the high 32 bits of the supercall argument.
+ *
+ * NOTE: current KernelPatch (checked through 0.13.9) does NOT validate this —
+ * kernel/patch/common/supercall.c only uses `ver_xx_cmd & 0xFFFF` as the command
+ * and explicitly leaves version parsing commented out ("todo: from 0.10.5").
+ * Set it to the KP version actually running on the device (0.13.9 = 0x0D09) so
+ * the value stays correct if a future KP starts enforcing it. */
 #define MAJOR 0
 #define MINOR 13
-#define PATCH 1
+#define PATCH 9
 
 static inline long ver_and_cmd(const char *key, long cmd)
 {

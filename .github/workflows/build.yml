@@ -10,7 +10,7 @@ on:
       kp_ref:
         description: 'KernelPatch ref (tag / branch / sha) used as the KPM SDK'
         required: false
-        default: '0.13.1'
+        default: '0.13.9'
 
 permissions:
   contents: write
@@ -20,8 +20,9 @@ jobs:
     name: KPM + userspace (arm64)
     runs-on: ubuntu-latest
     env:
-      # KernelPatch source is required as the KPM SDK (headers only, no kpimg build)
-      KP_REF: ${{ github.event.inputs.kp_ref || '0.13.1' }}
+      # KernelPatch source is required as the KPM SDK (headers only, no kpimg build).
+      # Default tracks the KP version actually running on the target device.
+      KP_REF: ${{ github.event.inputs.kp_ref || '0.13.9' }}
       KP_DIR: ${{ github.workspace }}/.kp/KernelPatch
 
     steps:
