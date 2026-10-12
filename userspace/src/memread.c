@@ -1,4 +1,8 @@
 /* memread - read bytes from /proc/pid/mem at given address */
+/* glibc hides lseek64()/off64_t behind this macro; bionic (Android) always
+ * exposes them, so this only matters when cross-compiling with glibc. */
+#define _LARGEFILE64_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
