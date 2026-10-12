@@ -9,6 +9,7 @@
 #define __NR_supercall 45
 
 #define SUPERCALL_HELLO      0x1000
+#define SUPERCALL_KERNELPATCH_VER 0x1008
 #define SUPERCALL_HELLO_MAGIC 0x11581158
 #define SUPERCALL_KPM_LOAD   0x1020
 #define SUPERCALL_KPM_UNLOAD 0x1021
@@ -65,6 +66,14 @@ static long sc_kpm_list(char *buf, int buf_len)
                    buf, buf_len);
 }
 
+/* Running KernelPatch version, as a 0xMMmmpp code (0.13.9 -> 0x000D09).
+ * This is the kpimg actually resident in the device kernel, NOT the version of
+ * this userspace binary — unlike `kptools -v`, which only reports locally. */
+static long sc_kp_ver(void)
+{
+    return syscall(__NR_supercall, SUPERKEY, ver_and_cmd(SUPERKEY, SUPERCALL_KERNELPATCH_VER));
+}
+
 static long sc_kpm_info(const char *name, char *buf, int buf_len)
 {
     return syscall(__NR_supercall, SUPERKEY, ver_and_cmd(SUPERKEY, SUPERCALL_KPM_INFO),
@@ -82,6 +91,7 @@ static void usage(void)
     printf("kpm_loader — KPM dynamic load/unload via supercall\n\n");
     printf("Usage:\n");
     printf("  kpm_loader hello              Test supercall connection\n");
+    printf("  kpm_loader kpver              Print the running KernelPatch version\n");
     printf("  kpm_loader list               List loaded KPMs\n");
     printf("  kpm_loader info <name>        Show KPM info\n");
     printf("  kpm_loader load <path> [args] Load KPM from file\n");
@@ -113,6 +123,23 @@ int main(int argc, char *argv[])
     if (sc_hello() != SUPERCALL_HELLO_MAGIC) {
         printf("[-] KernelPatch not active\n");
         return 1;
+    }
+
+    /* kpver: which KernelPatch is running on this device.
+     * Use the same value for the CI `kp_ref` input when building the KPM. */
+    if (strcmp(action, "kpver") == 0) {
+        long ver = sc_kp_ver();
+        if (ver <= 0) {
+            printf("[-] SUPERCALL_KERNELPATCH_VER failed (ret=%ld)\n", ver);
+            return 1;
+        }
+        unsigned major = (unsigned)((ver >> 16) & 0xFF);
+        unsigned minor = (unsigned)((ver >> 8) & 0xFF);
+        unsigned patch = (unsigned)(ver & 0xFF);
+        printf("[+] running KernelPatch: %u.%u.%u (0x%06lx)\n", major, minor, patch, ver);
+        printf("[*] build the KPM with kp_ref=%u.%u.%u to match:\n", major, minor, patch);
+        printf("[*]   gh workflow run build.yml -f kp_ref=%u.%u.%u\n", major, minor, patch);
+        return 0;
     }
 
     /* list */

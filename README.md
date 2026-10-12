@@ -79,7 +79,7 @@ xiaojianbang_hook ── syscall 285 ──→ stealth_hook.c dispatch
 |------|------|------|
 | CPU | arm64 | 仅支持 ARM64 架构 |
 | 内核 | 5.4+ GKI | Android GKI 内核（Google 通用内核镜像） |
-| KernelPatch | 0.13.x | kpimg 版本 d01，提供 KPM 加载能力 |
+| KernelPatch | 0.13.x | kpimg 提供 KPM 加载能力，已验证 0.13.1 / 0.13.9 |
 | APatch | 已安装 | 用于加载 KPM 模块和提供 su 权限 |
 | Bootloader | 已解锁 | APatch/KernelPatch 的前提 |
 
@@ -90,6 +90,46 @@ xiaojianbang_hook ── syscall 285 ──→ stealth_hook.c dispatch
 | Pixel 6 (oriole) | Android 15 | 5.10.209 |
 
 理论上所有满足上述条件的 arm64 GKI 设备都可以使用。
+
+### KernelPatch 版本兼容性
+
+KPM 自身的 17 个未定义符号（`hook_wrap`、`fp_wrap_syscalln`、`kf_memcpy`、`thread_size` 等）**全部由 kpimg 在加载时解析**，所以构建 KPM 所用的 KernelPatch 头文件版本应与设备上正在运行的 kpimg 对应。
+
+| 设备上的 kpimg | 构建用 `kp_ref` | 导出符号数 | 状态 |
+|----------------|-----------------|-----------|------|
+| 0.13.1 | `0.13.1` | 148 | ✅ 已验证 |
+| 0.13.9 | `0.13.9` | 173 | ✅ 已验证（CI 默认值） |
+
+**向后兼容**：0.13.1 → 0.13.9 的 173 个导出符号中**没有任何符号被移除**（严格超集），因此用 0.13.1 头文件编出的 `.kpm` 也能正常加载到 0.13.9 设备上。
+
+两点需要说明：
+
+1. **supercall 版本号不参与校验**。`kpm_loader` 会把 KP 版本号填进 supercall 参数的高 32 位，但 KP 内核侧（`kernel/patch/common/supercall.c`）目前只取低 16 位作命令，**版本解析被显式注释掉**（源码中的 `todo: from 0.10.5`），因此版本号填错也不影响加载。
+2. **与内核版本无关**。KPM 不固定依赖任何内核符号地址，全部在运行时通过 `kallsyms_lookup_name` 解析。
+
+#### 查询设备上的 KernelPatch 版本
+
+`kptools -v` 只打印**本地**工具版本，需要用 supercall `0x1008` 查设备上实际运行的 kpimg：
+
+```bash
+adb push kpm_loader /data/local/tmp/
+adb shell "su -c 'chmod 755 /data/local/tmp/kpm_loader && /data/local/tmp/kpm_loader kpver' 2>&1"
+# [+] running KernelPatch: 0.13.9 (0x000d09)
+# [*] build the KPM with kp_ref=0.13.9 to match:
+# [*]   gh workflow run build.yml -f kp_ref=0.13.9
+```
+
+#### 按指定版本构建
+
+CI 默认用 `0.13.9`（见 `.github/workflows/build.yml`）。换设备或升级 KP 时，临时指定或改默认值：
+
+```bash
+# 临时指定（不改仓库）
+gh workflow run build.yml -f kp_ref=0.13.1
+
+# 或改默认值后提交
+git tag v1.0.2 && git push origin v1.0.2   # 打 tag 会自动发 Release
+```
 
 ---
 
@@ -107,6 +147,35 @@ adb shell "su -c 'chmod 755 /data/local/tmp/xiaojianbang_hook'"
 # 3. 验证
 adb shell "su -c '/data/local/tmp/xiaojianbang_hook --pid 1 --so libc.so --offset 0x1' 2>&1"
 # 看到 "[+] libc.so base=..." 即正常
+```
+
+---
+
+## 构建（CI）
+
+本项目**不推荐本地编译**，请用 GitHub Actions 出包（workflow：`.github/workflows/build.yml`）。
+
+```bash
+# 触发构建（手动指定 KP 版本）
+gh workflow run build.yml -f kp_ref=0.13.9
+
+# 盯运行结果（事件驱动，不要盲目 sleep）
+gh run watch $(gh run list -L1 --json databaseId -q '.[0].databaseId') --exit-status --interval 20
+
+# 下载产物
+gh run download <run-id> -n xiaojianbang-stealth-hook -D dist
+
+# 发正式版：打 tag 自动发 Release（只附 .kpm + xiaojianbang_hook）
+git tag v1.0.2 && git push origin v1.0.2
+```
+
+CI 流程：clone KernelPatch 作为 KPM SDK → clang 编 `.kpm` → `aarch64-linux-gnu-gcc` 编用户态静态程序 → `readelf` 断言 AArch64 → 上传 artifact。
+
+**为什么不在本地编**：`kpm/Makefile` 里的 clang 是作者本机 AOSP 路径，且本地工具链（clang/NDK 版本）与 CI 不一致，本地成功≠CI 成功。若必须本地编，用 `CC=` 覆盖：
+
+```bash
+make -C kpm KP_DIR=/path/to/KernelPatch CC=clang
+make -C userspace TARGET_COMPILE=aarch64-linux-gnu-
 ```
 
 ---
@@ -228,6 +297,7 @@ xiaojianbang_hook --unhook --pid $PID --so libwtf.so --offset 0x4161c
 ```
 xiaojianbang-stealth-hook/
 ├── README.md                       # 本文档
+├── .github/workflows/build.yml     # CI：编 KPM + 用户态，打 tag 自动发 Release
 ├── kpm/                            # 内核模块源码
 │   ├── stealth_hook.c              # syscall bridge + dispatch
 │   ├── stealth_hook.h              # 命令定义 + 结构体
@@ -241,7 +311,7 @@ xiaojianbang-stealth-hook/
 │   ├── src/xiaojianbang_hook.c     # 主工具
 │   ├── src/dbi_recompiler.c        # DBI 指令重编译
 │   ├── src/dbi_decoder.c           # ARM64 指令分类器
-│   ├── src/kpm_loader.c            # KPM 动态加载/卸载
+│   ├── src/kpm_loader.c            # KPM 动态加载/卸载 + 查询运行中 KP 版本
 │   ├── src/sh_control.c            # KPM 状态检查
 │   ├── src/memread.c               # /proc/pid/mem 辅助
 │   ├── include/dbi.h
