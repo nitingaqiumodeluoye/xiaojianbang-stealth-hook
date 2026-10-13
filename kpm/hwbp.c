@@ -49,9 +49,22 @@ extern struct task_struct *(*kf_find_task_by_vpid)(pid_t nr);
 static long (*kf_copy_from_user_nofault)(void *dst, const void __user *src, unsigned long size) = 0;
 
 #define PERF_TYPE_BREAKPOINT 5
+#define HW_BREAKPOINT_R 1
+#define HW_BREAKPOINT_W 2
 #define HW_BREAKPOINT_X 4
+#define HW_BREAKPOINT_LEN_1 1
+#define HW_BREAKPOINT_LEN_2 2
 #define HW_BREAKPOINT_LEN_4 4
+#define HW_BREAKPOINT_LEN_8 8
 #define SH_MAX_ERRNO 4095
+
+/* msr pan, #0 / #1 : user memory is only reachable from the debug exception
+ * with PAN cleared. Same encoding used by the existing mem_dump path. */
+#define SH_PAN_OFF() asm volatile(".inst 0xd500409f" ::: "memory")
+#define SH_PAN_ON()  asm volatile(".inst 0xd500419f" ::: "memory")
+
+/* Is this a data watchpoint node (as opposed to an execution breakpoint)? */
+#define SH_NODE_IS_WATCH(n) ((n)->flags & (SH_HWBP_FLAG_READ | SH_HWBP_FLAG_WRITE))
 
 struct sh_perf_event_attr {
     uint32_t type;
@@ -97,7 +110,7 @@ static uint32_t hwbp_handler_unmatched_count;
 
 struct hwbp_node {
     struct list_head list;
-    uint64_t target_addr;       /* original hook address */
+    uint64_t target_addr;       /* original hook address (watch: watched VA) */
     uint64_t orig_bp_addr;      /* saved original bp address */
     uint64_t bp_addr;           /* current bp address (may be LR for state machine) */
     uint32_t tid;
@@ -132,6 +145,18 @@ struct hwbp_node {
     uint64_t override_mask;     /* bit N = override regs[N] on entry */
     uint64_t override_args[8];  /* replacement values for X0-X7 */
     uint64_t ret_value;         /* return value when SKIP_ORIGIN */
+    /* ---- data watchpoint state (SH_NODE_IS_WATCH) ---- */
+    uint64_t watch_addr;        /* watched user VA */
+    uint32_t bp_len;            /* 1/2/4/8 */
+    uint32_t watch_type;        /* SH_WATCH_* */
+    uint32_t stack_size;        /* snapshot bytes on early hits */
+    uint32_t max_hits;          /* auto-disable threshold (0 = unlimited) */
+    uint32_t ring_head;         /* next ring slot to write */
+    uint32_t ring_total;        /* how many hits were recorded */
+    uint32_t stack_len;         /* valid bytes in stack[] */
+    uint32_t stack_hits;        /* how many stack snapshots taken so far */
+    struct sh_hwbp_hit ring[SH_HITS_MAX];
+    uint8_t  stack[SH_STACK_MAX];
 };
 
 static void ensure_hwbp_list_init(void)
@@ -216,6 +241,105 @@ static void fill_execute_attr(struct sh_perf_event_attr *attr, uint64_t addr, in
 }
 
 /*
+ * Data watchpoint attribute.
+ * bp_type: HW_BREAKPOINT_R / W / (R|W).
+ * bp_len : 1/2/4/8 - arm64 arch_build_bp_info() requires the address to be
+ *          aligned to the length, so callers must not pass a misaligned pair.
+ */
+static void fill_watch_attr(struct sh_perf_event_attr *attr, uint64_t addr,
+                            uint32_t bp_len, uint32_t bp_type, int disabled)
+{
+    memset(attr, 0, sizeof(*attr));
+    attr->type = PERF_TYPE_BREAKPOINT;
+    attr->size = sizeof(*attr);
+    attr->sample_period = 1;
+    attr->bp_type = bp_type;
+    attr->bp_addr = addr;
+    attr->bp_len = bp_len;
+    if (disabled)
+        attr->flags = 1;
+}
+
+static uint32_t watch_bp_type(uint32_t type)
+{
+    if (type == SH_WATCH_READ)
+        return HW_BREAKPOINT_R;
+    if (type == SH_WATCH_RW)
+        return HW_BREAKPOINT_R | HW_BREAKPOINT_W;
+    return HW_BREAKPOINT_W;
+}
+
+static uint32_t watch_node_flags(uint32_t type)
+{
+    uint32_t f = 0;
+    if (type == SH_WATCH_READ || type == SH_WATCH_RW)
+        f |= SH_HWBP_FLAG_READ;
+    if (type == SH_WATCH_WRITE || type == SH_WATCH_RW)
+        f |= SH_HWBP_FLAG_WRITE;
+    return f;
+}
+
+/*
+ * Record one watchpoint hit.
+ * Runs in debug-exception context: no sleeping, no allocation. User memory is
+ * only readable with PAN cleared (same trick as the existing mem_dump path).
+ */
+static void hwbp_watch_record(struct hwbp_node *node, struct sh_pt_regs *regs)
+{
+    struct sh_hwbp_hit *h;
+    uint32_t idx = node->ring_head;
+    uint32_t n;
+    int i;
+
+    node->hit_count++;
+    node->last_pc = regs->pc;
+    node->last_x0 = regs->regs[0];
+    node->last_x1 = regs->regs[1];
+
+    h = &node->ring[idx];
+    for (i = 0; i < 8; i++)
+        h->x[i] = 0;
+    for (i = 0; i < SH_HIT_ST_WORDS; i++)
+        h->st[i] = 0;
+    h->pc = regs->pc;
+    h->lr = STRIP_PAC(regs->regs[30]);
+    h->sp = regs->sp;
+    h->addr = node->watch_addr;
+    h->val = 0;
+    for (i = 0; i < 8; i++)
+        h->x[i] = regs->regs[i];
+
+    SH_PAN_OFF();
+    /* value currently stored at the watched address */
+    for (i = 0; i < (int)node->bp_len && i < 8; i++)
+        ((uint8_t *)&h->val)[i] = *(volatile uint8_t *)(node->watch_addr + (uint64_t)i);
+    /* first stack words: the store's caller chain lives just above sp */
+    if (regs->sp > 0x1000ULL && regs->sp < 0x0000FFFFFFFFFFFFULL) {
+        for (i = 0; i < SH_HIT_ST_WORDS; i++)
+            h->st[i] = *(volatile uint64_t *)(regs->sp + (uint64_t)i * 8);
+        if (node->stack_size && node->stack_hits < 8) {
+            n = node->stack_size > SH_STACK_MAX ? SH_STACK_MAX : node->stack_size;
+            for (i = 0; i < (int)n; i++)
+                node->stack[i] = *(volatile uint8_t *)(regs->sp + (uint64_t)i);
+            node->stack_len = n;
+            node->stack_hits++;
+        }
+    }
+    SH_PAN_ON();
+
+    node->ring_head = (idx + 1) % SH_HITS_MAX;
+    if (node->ring_total < 0xffffffffu)
+        node->ring_total++;
+
+    /* Safety valve: a hot address would otherwise trap forever. */
+    if (node->max_hits && node->hit_count >= node->max_hits) {
+        node->is_disabled = 1;
+        if (kf_perf_event_disable && node->bp_handle)
+            kf_perf_event_disable(node->bp_handle);
+    }
+}
+
+/*
  * Hardware breakpoint trigger callback.
  * Implements:
  * 1. Inline Hook: redirect PC to trampoline
@@ -249,6 +373,14 @@ static void hwbp_handler(void *bp, void *sample_data, struct sh_pt_regs *regs)
 
     if (!matched || matched->is_disabled) {
         hwbp_handler_unmatched_count++;
+        return;
+    }
+
+    /* Data watchpoint: pure observation. The pc must NOT be touched -
+     * a watchpoint trap points at the faulting store instruction and the
+     * instruction has to be re-executed after we return. */
+    if (SH_NODE_IS_WATCH(matched)) {
+        hwbp_watch_record(matched, regs);
         return;
     }
 
@@ -350,7 +482,7 @@ static void hwbp_handler(void *bp, void *sample_data, struct sh_pt_regs *regs)
      * PAN must be disabled to read user memory in debug exception context. */
     if (matched->dump_size) {
         uint32_t dn = matched->dump_size > 128 ? 128 : matched->dump_size;
-        asm volatile(".inst 0xd500409f" ::: "memory");  /* msr pan, #0 */
+        SH_PAN_OFF();
         for (int i = 0; i < 8; i++) {
             uint64_t ptr = regs->regs[i];
             if (ptr < 0x100000ULL || ptr > 0x7FFFFFFFFFFFULL) {
@@ -361,7 +493,7 @@ static void hwbp_handler(void *bp, void *sample_data, struct sh_pt_regs *regs)
                 matched->mem_dump[i][j] = *(volatile uint8_t *)(ptr + j);
             matched->mem_len[i] = (uint16_t)dn;
         }
-        asm volatile(".inst 0xd500419f" ::: "memory");  /* msr pan, #1 */
+        SH_PAN_ON();
     }
 
     /* State machine: ALWAYS jump BP to LR after entry capture.
@@ -747,6 +879,180 @@ long sh_hwbp_set_skip(uint64_t target_addr, uint32_t skip_count)
     return found > 0 ? 0 : -2;
 }
 
+/*
+ * Register a data watchpoint on one thread.
+ * Userspace drives this per-TID (the tool enumerates /proc/<pid>/task) and then
+ * calls SH_CMD_HWBP_WATCH_AUTO so threads spawned later are covered too.
+ */
+long sh_hwbp_watch(struct sh_hwbp_watch __user *req)
+{
+    struct sh_hwbp_watch kreq;
+    struct hwbp_node *node;
+    struct sh_perf_event_attr attr;
+    uint32_t bptype;
+    void *task;
+
+    ensure_hwbp_list_init();
+
+    if (!kf_copy_from_user || kf_copy_from_user(&kreq, req, sizeof(kreq)))
+        return -14;
+    if (!resolve_hwbp_symbols())
+        return -95;
+    if (!kf_find_task_by_vpid || !kf_vmalloc)
+        return -95;
+
+    if (!kreq.watch_addr || kreq.watch_addr >= 0x0000800000000000ULL) {
+        pr_err("[hwbp] watch: bad address 0x%llx\n", kreq.watch_addr);
+        return -22;
+    }
+    if (!kreq.bp_len)
+        kreq.bp_len = HW_BREAKPOINT_LEN_8;
+    if (kreq.bp_len != 1 && kreq.bp_len != 2 && kreq.bp_len != 4 && kreq.bp_len != 8) {
+        pr_err("[hwbp] watch: bad bp_len %u\n", kreq.bp_len);
+        return -22;
+    }
+    /* arm64 arch_build_bp_info() enforces address alignment to bp_len */
+    if (kreq.watch_addr & (uint64_t)(kreq.bp_len - 1)) {
+        pr_err("[hwbp] watch: addr 0x%llx not aligned to len %u\n", kreq.watch_addr, kreq.bp_len);
+        return -22;
+    }
+    if (kreq.type != SH_WATCH_READ && kreq.type != SH_WATCH_WRITE && kreq.type != SH_WATCH_RW)
+        return -22;
+
+    task = kf_find_task_by_vpid((pid_t)kreq.tid);
+    if (!task) {
+        pr_err("[hwbp] watch: tid %u not found\n", kreq.tid);
+        return -3;
+    }
+
+    node = (struct hwbp_node *)kf_vmalloc(sizeof(struct hwbp_node));
+    if (!node)
+        return -12;
+    memset(node, 0, sizeof(*node));
+
+    node->target_addr = kreq.watch_addr;
+    node->orig_bp_addr = kreq.watch_addr;
+    node->bp_addr = kreq.watch_addr;
+    node->tid = kreq.tid;
+    node->pid = kreq.tid;
+    node->flags = watch_node_flags(kreq.type);
+    node->watch_addr = kreq.watch_addr;
+    node->bp_len = kreq.bp_len;
+    node->watch_type = kreq.type;
+    node->stack_size = kreq.stack_size > SH_STACK_MAX ? SH_STACK_MAX : kreq.stack_size;
+    node->max_hits = kreq.max_hits ? kreq.max_hits : SH_WATCH_DEF_MAX_HITS;
+    node->dump_size = 0;
+    node->is_disabled = 0;
+
+    bptype = watch_bp_type(kreq.type);
+    fill_watch_attr(&attr, node->watch_addr, node->bp_len, bptype, 0);
+    if (kf_perf_event_create_kernel_counter)
+        node->bp_handle = kf_perf_event_create_kernel_counter(&attr, -1, task, hwbp_handler, 0);
+    else
+        node->bp_handle = kf_register_user_hw_breakpoint(&attr, hwbp_handler, 0, task);
+
+    if (!node->bp_handle || (uint64_t)node->bp_handle >= (uint64_t)-SH_MAX_ERRNO) {
+        long err = node->bp_handle ? (long)node->bp_handle : -5;
+        pr_err("[hwbp] watch register failed: addr=0x%llx len=%u type=%u tid=%u err=%ld\n",
+               node->watch_addr, node->bp_len, node->watch_type, node->tid, err);
+        kf_vfree(node);
+        return err;
+    }
+
+    node->list.next = hwbp_list_head.next;
+    node->list.prev = &hwbp_list_head;
+    hwbp_list_head.next->prev = &node->list;
+    hwbp_list_head.next = &node->list;
+
+    sh_dbg("[hwbp] watch armed: tid=%u addr=0x%llx len=%u type=%u\n",
+            node->tid, node->watch_addr, node->bp_len, node->watch_type);
+    return 0;
+}
+
+/*
+ * Read a watchpoint node's hit ring.
+ * Copies the small header and then each ring entry separately, so no big
+ * kernel-stack object is needed (struct sh_hwbp_hits is ~4.6 KB).
+ */
+long sh_hwbp_hits(struct sh_hwbp_hits __user *req)
+{
+    struct sh_hwbp_hits __user *ureq = req;
+    struct sh_hwbp_hits_hdr kh;
+    struct list_head *pos;
+    struct hwbp_node *node = 0;
+    uint32_t idx = 0, total = 0, i, n, guard;
+    int copied;
+
+    ensure_hwbp_list_init();
+
+    if (!kf_copy_from_user || kf_copy_from_user(&kh, &ureq->hdr, sizeof(kh)))
+        return -14;
+
+    /* pick the node_index-th node matching (addr, optional tid) */
+    for (pos = hwbp_list_head.next; pos != &hwbp_list_head; pos = pos->next) {
+        struct hwbp_node *cand = (struct hwbp_node *)((char *)pos -
+                                 __builtin_offsetof(struct hwbp_node, list));
+        if (!SH_NODE_IS_WATCH(cand))
+            continue;
+        if (cand->watch_addr != kh.watch_addr)
+            continue;
+        if (kh.tid && cand->tid != kh.tid)
+            continue;
+        if (idx == kh.node_index)
+            node = cand;
+        idx++;
+    }
+    total = idx;
+    kh.node_total = total;
+
+    if (!node) {
+        kh.count = 0;
+        kh.total = 0;
+        kh.stack_len = 0;
+        kh.tid = 0;
+        if (compat_copy_to_user(&ureq->hdr, &kh, sizeof(kh)) != (int)sizeof(kh))
+            return -14;
+        return total ? 0 : -2;
+    }
+
+    kh.tid = node->tid;
+    kh.total = node->ring_total;
+    kh.stack_len = node->stack_len;
+    kh.bp_len = node->bp_len;
+    kh.is_armed = node->is_disabled ? 0 : 1;
+    kh.hit_count = node->hit_count;
+    kh.ring_head = node->ring_head;
+    kh.max_hits = node->max_hits;
+
+    /* oldest -> newest */
+    n = node->ring_total < SH_HITS_MAX ? node->ring_total : SH_HITS_MAX;
+    for (i = 0; i < n; i++) {
+        uint32_t slot;
+        if (node->ring_total < SH_HITS_MAX)
+            slot = i;
+        else
+            slot = (node->ring_head + i) % SH_HITS_MAX;
+        if (compat_copy_to_user(&ureq->entries[i], &node->ring[slot],
+                                sizeof(struct sh_hwbp_hit)) != (int)sizeof(struct sh_hwbp_hit)) {
+            kh.count = i;
+            compat_copy_to_user(&ureq->hdr, &kh, sizeof(kh));
+            return -14;
+        }
+    }
+    kh.count = n;
+
+    if (node->stack_len) {
+        guard = node->stack_len > SH_STACK_MAX ? SH_STACK_MAX : node->stack_len;
+        if (compat_copy_to_user(&ureq->stack[0], &node->stack[0], guard) != (int)guard)
+            kh.stack_len = 0;
+    }
+
+    copied = compat_copy_to_user(&ureq->hdr, &kh, sizeof(kh));
+    if (copied != (int)sizeof(kh))
+        return -14;
+    return 0;
+}
+
 void sh_hwbp_cleanup(void)
 {
     struct list_head *pos, *tmp;
@@ -779,6 +1085,11 @@ struct auto_thread_rule {
     uint64_t trampoline_addr;
     uint32_t tgid;
     uint32_t flags;
+    /* watchpoint config (bp_len != 0 -> arm a data watchpoint instead) */
+    uint32_t bp_len;
+    uint32_t type;
+    uint32_t stack_size;
+    uint32_t max_hits;
 };
 
 static struct auto_thread_rule auto_rules[SH_AUTO_THREAD_MAX];
@@ -786,8 +1097,35 @@ static int auto_rule_count = 0;
 static void *wake_up_fn = 0;
 static int wake_up_hooked = 0;
 
-/* PID helpers */
+/* PID helpers.
+ * NOTE: task_tgid_nr()/task_pid_nr() are `static inline` in this kernel and are
+ * therefore absent from /proc/kallsyms - the old task_tgid_nr lookup always
+ * failed and silently disabled auto-thread registration. __task_pid_nr_ns() is
+ * a real exported function, so prefer it and keep the old name as a fallback. */
 static pid_t (*kf_task_tgid_nr)(void *task) = 0;
+static pid_t (*kf_task_pid_nr)(void *task) = 0;
+static pid_t (*kf_task_pid_nr_ns)(void *task, int type, void *ns) = 0;
+
+#define SH_PIDTYPE_PID  0
+#define SH_PIDTYPE_TGID 1
+
+static uint32_t sh_task_tgid(void *task)
+{
+    if (kf_task_pid_nr_ns)
+        return (uint32_t)kf_task_pid_nr_ns(task, SH_PIDTYPE_TGID, 0);
+    if (kf_task_tgid_nr)
+        return (uint32_t)kf_task_tgid_nr(task);
+    return 0;
+}
+
+static uint32_t sh_task_pid(void *task)
+{
+    if (kf_task_pid_nr_ns)
+        return (uint32_t)kf_task_pid_nr_ns(task, SH_PIDTYPE_PID, 0);
+    if (kf_task_pid_nr)
+        return (uint32_t)kf_task_pid_nr(task);
+    return 0;
+}
 
 static void wake_up_new_task_after(hook_fargs1_t *args, void *udata)
 {
@@ -796,20 +1134,30 @@ static void wake_up_new_task_after(hook_fargs1_t *args, void *udata)
     if (!new_task || !auto_rule_count)
         return;
 
+    if (!kf_task_pid_nr_ns)
+        kf_task_pid_nr_ns = (typeof(kf_task_pid_nr_ns))kallsyms_lookup_name("__task_pid_nr_ns");
     if (!kf_task_tgid_nr)
         kf_task_tgid_nr = (typeof(kf_task_tgid_nr))kallsyms_lookup_name("task_tgid_nr");
-    if (!kf_task_tgid_nr)
+    if (!kf_task_pid_nr)
+        kf_task_pid_nr = (typeof(kf_task_pid_nr))kallsyms_lookup_name("task_pid_nr");
+    if (!kf_task_pid_nr_ns && !kf_task_tgid_nr)
         return;
 
-    uint32_t new_tgid = (uint32_t)kf_task_tgid_nr(new_task);
+    uint32_t new_tgid = sh_task_tgid(new_task);
+    if (!new_tgid)
+        return;
 
     for (int i = 0; i < auto_rule_count; i++) {
         if (auto_rules[i].tgid != new_tgid)
             continue;
 
-        /* Register HWBP on the new thread */
+        /* Register the same breakpoint/watchpoint on the new thread */
         struct sh_perf_event_attr attr;
-        fill_execute_attr(&attr, auto_rules[i].target_addr, 0);
+        if (auto_rules[i].bp_len)
+            fill_watch_attr(&attr, auto_rules[i].target_addr, auto_rules[i].bp_len,
+                            watch_bp_type(auto_rules[i].type), 0);
+        else
+            fill_execute_attr(&attr, auto_rules[i].target_addr, 0);
 
         void *bp = 0;
         if (kf_perf_event_create_kernel_counter)
@@ -828,8 +1176,23 @@ static void wake_up_new_task_after(hook_fargs1_t *args, void *udata)
         node->target_addr = auto_rules[i].target_addr;
         node->orig_bp_addr = auto_rules[i].target_addr;
         node->bp_addr = auto_rules[i].target_addr;
-        node->flags = auto_rules[i].flags;
-        node->trampoline_addr = auto_rules[i].trampoline_addr;
+        if (auto_rules[i].bp_len) {
+            node->flags = auto_rules[i].flags | watch_node_flags(auto_rules[i].type);
+            node->watch_addr = auto_rules[i].target_addr;
+            node->bp_len = auto_rules[i].bp_len;
+            node->watch_type = auto_rules[i].type;
+            node->stack_size = auto_rules[i].stack_size > SH_STACK_MAX
+                             ? SH_STACK_MAX : auto_rules[i].stack_size;
+            node->max_hits = auto_rules[i].max_hits ? auto_rules[i].max_hits
+                                                    : SH_WATCH_DEF_MAX_HITS;
+            /* Handler matches on bp_handle, so tid is only a label here.
+             * Recover it best-effort; 0 means "unknown thread". */
+            node->tid = sh_task_pid(new_task);
+            node->pid = new_tgid;
+        } else {
+            node->flags = auto_rules[i].flags;
+            node->trampoline_addr = auto_rules[i].trampoline_addr;
+        }
         node->bp_handle = bp;
 
         node->list.next = hwbp_list_head.next;
@@ -864,6 +1227,52 @@ long sh_hwbp_auto_thread(uint64_t target_addr, uint32_t tgid,
     auto_rules[auto_rule_count].tgid = tgid;
     auto_rules[auto_rule_count].trampoline_addr = trampoline_addr;
     auto_rules[auto_rule_count].flags = flags;
+    auto_rule_count++;
+
+    return 0;
+}
+
+/*
+ * Auto-arm the same data watchpoint on threads of @tgid created later.
+ * Same node ring per thread, so still read them one by one via SH_CMD_HWBP_HITS.
+ */
+long sh_hwbp_watch_auto(uint64_t watch_addr, uint32_t tgid, uint32_t bp_len, uint32_t type)
+{
+    ensure_hwbp_list_init();
+    if (!resolve_hwbp_symbols())
+        return -95;
+    if (!watch_addr || watch_addr >= 0x0000800000000000ULL)
+        return -22;
+    if (!bp_len)
+        bp_len = HW_BREAKPOINT_LEN_8;
+    if (bp_len != 1 && bp_len != 2 && bp_len != 4 && bp_len != 8)
+        return -22;
+    if (watch_addr & (uint64_t)(bp_len - 1))
+        return -22;
+    if (type != SH_WATCH_READ && type != SH_WATCH_WRITE && type != SH_WATCH_RW)
+        return -22;
+
+    if (auto_rule_count >= SH_AUTO_THREAD_MAX)
+        return -28; /* ENOSPC */
+
+    if (!wake_up_hooked) {
+        wake_up_fn = (void *)kallsyms_lookup_name("wake_up_new_task");
+        if (!wake_up_fn)
+            return -2;
+        hook_err_t e = hook_wrap1(wake_up_fn, 0, wake_up_new_task_after, 0);
+        if (e)
+            return -1;
+        wake_up_hooked = 1;
+    }
+
+    auto_rules[auto_rule_count].target_addr = watch_addr;
+    auto_rules[auto_rule_count].tgid = tgid;
+    auto_rules[auto_rule_count].trampoline_addr = 0;
+    auto_rules[auto_rule_count].flags = watch_node_flags(type);
+    auto_rules[auto_rule_count].bp_len = bp_len;
+    auto_rules[auto_rule_count].type = type;
+    auto_rules[auto_rule_count].stack_size = SH_WATCH_DEF_STACK;
+    auto_rules[auto_rule_count].max_hits = SH_WATCH_DEF_MAX_HITS;
     auto_rule_count++;
 
     return 0;

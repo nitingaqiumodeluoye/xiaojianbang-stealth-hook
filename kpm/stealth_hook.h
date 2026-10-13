@@ -26,7 +26,7 @@
 
 #define SH_CMD_STATUS              0x0001
 #define SH_STATUS_MAGIC            0x53484F4B  /* "SHOK" */
-#define SH_VERSION_CODE            0x00010000
+#define SH_VERSION_CODE            0x00010001  /* v1.0.1: watchpoints (HW_BREAKPOINT_W/RW) */
 
 /* HWBP commands */
 #define SH_CMD_HWBP_HOOK           0x1001
@@ -41,6 +41,9 @@
 #define SH_CMD_HWBP_SET_ARG_TYPE  0x100A  /* DEPRECATED (replaced by mem dump) */
 #define SH_CMD_HWBP_READ_STR      0x100B  /* DEPRECATED (replaced by mem dump in query) */
 #define SH_CMD_HWBP_SET_SKIP     0x100C  /* set skip count: capture Nth hit */
+#define SH_CMD_HWBP_WATCH        0x100D  /* register a DATA watchpoint (absolute user VA) */
+#define SH_CMD_HWBP_WATCH_AUTO   0x100E  /* auto-arm the same watchpoint on new threads */
+#define SH_CMD_HWBP_HITS         0x100F  /* read a watchpoint's hit ring + stack snapshot */
 
 /* PTE Hook commands */
 #define SH_CMD_PTE_HOOK            0x2001
@@ -104,6 +107,76 @@ struct sh_hwbp_query {
     /* Iteration cursor: query the Nth matching node (for per-thread enumeration) */
     uint32_t node_index;        /* in: which matching node to return (0-based) */
     uint32_t node_total;        /* out: total matching nodes for this target_addr */
+};
+
+/* ============================================================
+ * Data watchpoint (HW_BREAKPOINT_W / R / RW)
+ *
+ * Why: catching "who writes this buffer" cannot be answered by JNI-layer
+ * hooks when native code stores straight into an ART array's element memory.
+ * ARM64 gives 4 watchpoint registers per thread -> at most 4 x 8 bytes.
+ *
+ * Typical use: arm, let the target run, then read the hit ring, which carries
+ * pc/lr/sp + x0-x7 + a mini stack slice for every store that landed on the
+ * watched bytes.
+ * ============================================================ */
+
+#define SH_HITS_MAX     32      /* hit ring entries per node (per thread) */
+#define SH_STACK_MAX    256     /* stack snapshot bytes kept per node */
+#define SH_HIT_ST_WORDS 4       /* stack words captured inside each hit entry */
+
+/* watchpoint type */
+#define SH_WATCH_READ   0
+#define SH_WATCH_WRITE  1
+#define SH_WATCH_RW     2
+
+/* default when the caller leaves them 0 */
+#define SH_WATCH_DEF_STACK    128
+#define SH_WATCH_DEF_MAX_HITS 64
+
+struct sh_hwbp_watch {
+    uint64_t watch_addr;    /* absolute user VA, must be bp_len aligned */
+    uint32_t tid;           /* target thread id */
+    uint32_t bp_len;        /* 1 / 2 / 4 / 8 */
+    uint32_t type;          /* SH_WATCH_* */
+    uint32_t stack_size;    /* stack bytes snapshotted on the first hits (0 = off) */
+    uint32_t max_hits;      /* auto-disable after N hits (0 = default) */
+    uint32_t flags;         /* reserved, 0 */
+    uint64_t _pad;
+};
+
+/* one store that hit the watched bytes */
+struct sh_hwbp_hit {
+    uint64_t pc;            /* faulting (store) instruction */
+    uint64_t lr;            /* x30 at trap */
+    uint64_t sp;
+    uint64_t x[8];          /* x0-x7 */
+    uint64_t addr;          /* watched address */
+    uint64_t val;           /* value found at addr (bp_len bytes, little endian) */
+    uint64_t st[SH_HIT_ST_WORDS];  /* first stack words at sp */
+};
+
+/* header is copied in/out separately from the big tail buffers */
+struct sh_hwbp_hits_hdr {
+    uint64_t watch_addr;
+    uint32_t tid;           /* in: 0 = any node with this addr; out: node tid */
+    uint32_t node_index;    /* in: which matching node (0-based) */
+    uint32_t node_total;    /* out */
+    uint32_t total;         /* out: hits recorded by the node */
+    uint32_t count;         /* out: entries written to entries[] */
+    uint32_t stack_len;     /* out: valid bytes in stack[] */
+    uint32_t bp_len;        /* out */
+    uint32_t is_armed;      /* out: !is_disabled */
+    uint32_t hit_count;     /* out */
+    uint32_t ring_head;     /* out: next ring slot */
+    uint32_t max_hits;      /* out */
+    uint32_t _pad;
+};
+
+struct sh_hwbp_hits {
+    struct sh_hwbp_hits_hdr hdr;
+    struct sh_hwbp_hit entries[SH_HITS_MAX];
+    uint8_t stack[SH_STACK_MAX];
 };
 
 /* HWBP override request: modify args or skip origin */

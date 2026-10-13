@@ -91,6 +91,10 @@ extern long sh_hwbp_hook_full(struct sh_hwbp_request __user *req, void __user *c
                               uint32_t clone_size, uint32_t tramp_offset);
 extern long sh_hwbp_set_override(struct sh_hwbp_override __user *req);
 extern long sh_hwbp_set_skip(uint64_t target_addr, uint32_t skip_count);
+extern long sh_hwbp_watch(struct sh_hwbp_watch __user *req);
+extern long sh_hwbp_watch_auto(uint64_t watch_addr, uint32_t tgid,
+                               uint32_t bp_len, uint32_t type);
+extern long sh_hwbp_hits(struct sh_hwbp_hits __user *req);
 extern void sh_hwbp_cleanup(void);
 extern void sh_hwbp_auto_thread_cleanup(void);
 
@@ -149,6 +153,13 @@ static long sh_dispatch(long cmd, long arg1, long arg2, long arg3, long arg4)
         return sh_hwbp_set_override((struct sh_hwbp_override __user *)arg1);
     case SH_CMD_HWBP_SET_SKIP:
         return sh_hwbp_set_skip((uint64_t)arg1, (uint32_t)arg2);
+    case SH_CMD_HWBP_WATCH:
+        return sh_hwbp_watch((struct sh_hwbp_watch __user *)arg1);
+    case SH_CMD_HWBP_WATCH_AUTO:
+        return sh_hwbp_watch_auto((uint64_t)arg1, (uint32_t)arg2,
+                                  (uint32_t)arg3, (uint32_t)arg4);
+    case SH_CMD_HWBP_HITS:
+        return sh_hwbp_hits((struct sh_hwbp_hits __user *)arg1);
 
     /* PTE Hook */
     case SH_CMD_PTE_HOOK:

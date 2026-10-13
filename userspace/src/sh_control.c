@@ -18,7 +18,7 @@
 #define SH_SYSCALL_MAGIC    0x584A42
 #define SH_CMD_STATUS              0x0001
 #define SH_STATUS_MAGIC            0x53484F4B
-#define SH_VERSION_CODE            0x00010000
+#define SH_VERSION_CODE            0x00010001  /* v1.0.1: watchpoints */
 #define SH_CMD_HWBP_HOOK           0x1001
 #define SH_CMD_HWBP_UNHOOK         0x1002
 #define SH_CMD_HWBP_ENABLE         0x1003
@@ -51,6 +51,8 @@ struct sh_hwbp_request {
     uint32_t flags;
     uint64_t callback_addr;
     uint64_t trampoline_addr;
+    uint32_t dump_size;      /* keep in sync with kpm/stealth_hook.h */
+    uint32_t _pad;
 };
 
 struct sh_hwbp_query {
@@ -64,6 +66,14 @@ struct sh_hwbp_query {
     uint32_t is_waiting_return;
     uint32_t handler_enter_count;
     uint32_t handler_unmatched_count;
+    /* keep in sync with kpm/stealth_hook.h (extended capture) */
+    uint64_t entry_args[8];
+    uint64_t ret_x0;
+    uint64_t entry_lr;
+    uint8_t  mem_dump[8][128];
+    uint16_t mem_len[8];
+    uint32_t node_index;
+    uint32_t node_total;
 };
 
 struct sh_ghost_request {
